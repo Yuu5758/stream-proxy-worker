@@ -2,19 +2,10 @@ import { Hono } from 'hono'
 import { Buffer } from 'node:buffer'
 
 type Bindings = {
-	BACKEND_VERIFY_URL?: string
 	DEFAULT_REFERER?: string
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
-
-// In-memory cache for token validation (reduces latency on frequent segment requests)
-interface TokenCacheItem {
-	valid: boolean
-	expiresAt: number
-	user?: any
-}
-const tokenCache = new Map<string, TokenCacheItem>()
 
 const CORS_HEADERS = {
 	'Access-Control-Allow-Origin': '*',
@@ -24,91 +15,78 @@ const CORS_HEADERS = {
 }
 
 /**
- * Extract auth token/cookie from headers or query params
+ * Clean target URL and unwrap any recursive proxy layers, extracting leaked ref/origin.
  */
-function extractAuthToken(c: any): string | null {
-	// 1. Check Authorization Bearer header
-	const authHeader = c.req.header('Authorization') || c.req.header('authorization')
-	if (authHeader) {
-		const match = authHeader.match(/^Bearer\s+(.+)$/i)
-		if (match && match[1]?.trim()) {
-			return match[1].trim()
-		}
-	}
+function cleanTargetUrlAndExtractParams(targetUrl: string): {
+	cleanUrl: string
+	ref?: string
+	origin?: string
+} {
+	let current = targetUrl.trim()
+	let extractedRef: string | undefined
+	let extractedOrigin: string | undefined
 
-	// 2. Check Cookie header (nonton_jwt_token)
-	const cookieHeader = c.req.header('Cookie') || c.req.header('cookie')
-	if (cookieHeader) {
-		const cookies = cookieHeader.split(';')
-		for (const cookie of cookies) {
-			const [name, ...val] = cookie.trim().split('=')
-			if (name?.trim() === 'nonton_jwt_token') {
-				const tokenVal = val.join('=').trim()
-				if (tokenVal) return tokenVal
+	while (
+		current.includes('proxy.nonton.blog') ||
+		current.includes('/api/proxy')
+	) {
+		const mRef = current.match(/[?&](?:ref|referer)=([^&]+)/)
+		if (mRef && mRef[1] && !extractedRef) {
+			try {
+				extractedRef = decodeURIComponent(mRef[1])
+			} catch {
+				extractedRef = mRef[1]
 			}
 		}
-		// If only a raw token was passed in cookie
-		if (cookieHeader.trim().split('.').length === 3) {
-			return cookieHeader.trim()
+		const mOrig = current.match(/[?&]origin=([^&]+)/)
+		if (mOrig && mOrig[1] && !extractedOrigin) {
+			try {
+				extractedOrigin = decodeURIComponent(mOrig[1])
+			} catch {
+				extractedOrigin = mOrig[1]
+			}
+		}
+		const match = current.match(/[?&]url=([^&]+)/)
+		if (match && match[1]) {
+			try {
+				current = decodeURIComponent(match[1])
+			} catch {
+				current = match[1]
+			}
+		} else {
+			break
 		}
 	}
 
-	// 3. Check query parameters (?token=... or ?cookie=...)
-	const qToken = c.req.query('token') || c.req.query('cookie')
-	if (qToken?.trim()) {
-		return qToken.trim()
+	if (!current.includes('?') && current.includes('&')) {
+		current = current.replace('&', '?')
 	}
 
-	return null
-}
-
-/**
- * Verify token with the Rust backend
- */
-async function verifyTokenWithBackend(
-	token: string,
-	verifyUrl: string
-): Promise<{ valid: boolean; error?: string; user?: any }> {
-	const now = Date.now()
-	const cached = tokenCache.get(token)
-	if (cached && cached.expiresAt > now) {
-		return { valid: cached.valid, user: cached.user }
+	if (!current.startsWith('http://') && !current.startsWith('https://')) {
+		current = 'https://' + current
 	}
 
 	try {
-		const response = await fetch(verifyUrl, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				'User-Agent': 'stream-proxy-worker/1.0',
-				'Cookie': `nonton_jwt_token=${token}`,
-				'Authorization': `Bearer ${token}`
-			},
-			body: JSON.stringify({ token }),
-		})
-
-		const data = (await response.json()) as any
-
-		if (response.ok && data?.valid === true) {
-			// Cache valid token for 60 seconds (or up to token exp)
-			const ttlMs = data.exp ? Math.min((data.exp * 1000) - now, 60000) : 60000
-			tokenCache.set(token, {
-				valid: true,
-				expiresAt: now + Math.max(ttlMs, 10000),
-				user: data
-			})
-			return { valid: true, user: data }
+		const parsed = new URL(current)
+		if (!extractedRef) {
+			extractedRef = parsed.searchParams.get('ref') || parsed.searchParams.get('referer') || undefined
+		}
+		if (!extractedOrigin) {
+			extractedOrigin = parsed.searchParams.get('origin') || undefined
 		}
 
-		// Cache invalid token for 5 seconds to throttle hammering
-		tokenCache.set(token, {
-			valid: false,
-			expiresAt: now + 5000
-		})
-		return { valid: false, error: data?.error || 'Invalid session or token' }
-	} catch (err: any) {
-		console.error('Backend verification error:', err)
-		return { valid: false, error: `Verification service unavailable: ${err?.message || err}` }
+		parsed.searchParams.delete('ref')
+		parsed.searchParams.delete('referer')
+		parsed.searchParams.delete('token')
+		parsed.searchParams.delete('origin')
+
+		current = parsed.toString()
+	} catch {}
+
+	return {
+		cleanUrl: current,
+		ref: extractedRef,
+		origin: extractedOrigin
 	}
 }
 
@@ -119,7 +97,6 @@ function rewriteHlsManifest(
 	manifestText: string,
 	manifestUrl: string,
 	proxyOrigin: string,
-	token: string,
 	referer: string
 ): string {
 	const lines = manifestText.split('\n')
@@ -128,7 +105,7 @@ function rewriteHlsManifest(
 	const buildProxyUrl = (targetUri: string) => {
 		try {
 			const resolved = new URL(targetUri, manifestUrl).toString()
-			return `${proxyOrigin}/proxy?url=${encodeURIComponent(resolved)}&token=${encodeURIComponent(token)}&referer=${encodeURIComponent(referer)}`
+			return `${proxyOrigin}/proxy?url=${encodeURIComponent(resolved)}&ref=${encodeURIComponent(referer)}`
 		} catch {
 			return targetUri
 		}
@@ -171,12 +148,10 @@ function rewriteDashManifest(
 	mpdXml: string,
 	mpdUrl: string,
 	proxyOrigin: string,
-	token: string,
 	referer: string
 ): string {
-	const tokB64 = Buffer.from(token).toString('base64url')
 	const refB64 = Buffer.from(referer).toString('base64url')
-	const dashPrefix = `${proxyOrigin}/dash/${tokB64}/${refB64}/`
+	const dashPrefix = `${proxyOrigin}/dash/${refB64}/`
 
 	// Find the MPD base directory
 	const mpdBase = mpdUrl.substring(0, mpdUrl.lastIndexOf('/') + 1)
@@ -213,36 +188,24 @@ function rewriteDashManifest(
 }
 
 /**
- * Core Proxy Handler
+ * Core Proxy Handler (No cookies required)
  */
 async function handleStreamProxy(
 	c: any,
 	targetUrl: string,
-	referer: string,
-	token: string
+	referer: string
 ) {
-	// STRICT COOKIE CHECK: Token is mandatory
-	if (!token) {
-		return c.json({
-			error: 'Forbidden',
-			message: 'Wajib cookies/token: Autentikasi session nonton.blog diperlukan.'
-		}, 401, CORS_HEADERS)
-	}
-
-	// Verify token with Rust backend
-	const verifyUrl = c.env?.BACKEND_VERIFY_URL || 'https://nonton.blog/api/auth/verify-cookie'
-	const verifyResult = await verifyTokenWithBackend(token, verifyUrl)
-	if (!verifyResult.valid) {
-		return c.json({
-			error: 'Unauthorized',
-			message: `Verifikasi cookies gagal: ${verifyResult.error || 'Token tidak valid atau kedaluwarsa'}`
-		}, 401, CORS_HEADERS)
+	let originHeader = ''
+	try {
+		originHeader = new URL(referer).origin
+	} catch {
+		originHeader = 'https://nonton.blog'
 	}
 
 	// Setup headers to fetch target CDN
 	const fetchHeaders: Record<string, string> = {
 		'Referer': referer,
-		'Origin': new URL(referer).origin,
+		'Origin': originHeader,
 		'User-Agent': c.req.header('User-Agent') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 	}
 
@@ -252,8 +215,11 @@ async function handleStreamProxy(
 		fetchHeaders['Range'] = rangeHeader
 	}
 
-	// Forward Cookies to upstream CDN if client provided them
-	fetchHeaders['Cookie'] = `nonton_jwt_token=${token}`
+	// Forward client Cookie if any
+	const clientCookie = c.req.header('Cookie') || c.req.header('cookie')
+	if (clientCookie) {
+		fetchHeaders['Cookie'] = clientCookie
+	}
 
 	try {
 		const response = await fetch(targetUrl, {
@@ -272,7 +238,7 @@ async function handleStreamProxy(
 		// Rewrite HLS manifest
 		if (isHls && response.ok) {
 			const text = await response.text()
-			const rewritten = rewriteHlsManifest(text, targetUrl, proxyOrigin, token, referer)
+			const rewritten = rewriteHlsManifest(text, targetUrl, proxyOrigin, referer)
 			return new Response(rewritten, {
 				status: response.status,
 				headers: {
@@ -286,7 +252,7 @@ async function handleStreamProxy(
 		// Rewrite DASH manifest
 		if (isDash && response.ok) {
 			const text = await response.text()
-			const rewritten = rewriteDashManifest(text, targetUrl, proxyOrigin, token, referer)
+			const rewritten = rewriteDashManifest(text, targetUrl, proxyOrigin, referer)
 			return new Response(rewritten, {
 				status: response.status,
 				headers: {
@@ -344,105 +310,13 @@ app.options('*', (c) => {
 })
 
 /**
- * Clean target URL and unwrap any recursive proxy layers, extracting leaked ref/token/origin.
- */
-function cleanTargetUrlAndExtractParams(targetUrl: string): {
-	cleanUrl: string
-	ref?: string
-	token?: string
-	origin?: string
-} {
-	let current = targetUrl.trim()
-	let extractedRef: string | undefined
-	let extractedTok: string | undefined
-	let extractedOrigin: string | undefined
-
-	while (
-		current.includes('proxy.nonton.blog') ||
-		current.includes('/api/proxy')
-	) {
-		const mRef = current.match(/[?&](?:ref|referer)=([^&]+)/)
-		if (mRef && mRef[1] && !extractedRef) {
-			try {
-				extractedRef = decodeURIComponent(mRef[1])
-			} catch {
-				extractedRef = mRef[1]
-			}
-		}
-		const mTok = current.match(/[?&]token=([^&]+)/)
-		if (mTok && mTok[1] && !extractedTok) {
-			try {
-				extractedTok = decodeURIComponent(mTok[1])
-			} catch {
-				extractedTok = mTok[1]
-			}
-		}
-		const mOrig = current.match(/[?&]origin=([^&]+)/)
-		if (mOrig && mOrig[1] && !extractedOrigin) {
-			try {
-				extractedOrigin = decodeURIComponent(mOrig[1])
-			} catch {
-				extractedOrigin = mOrig[1]
-			}
-		}
-		const match = current.match(/[?&]url=([^&]+)/)
-		if (match && match[1]) {
-			try {
-				current = decodeURIComponent(match[1])
-			} catch {
-				current = match[1]
-			}
-		} else {
-			break
-		}
-	}
-
-	if (!current.includes('?') && current.includes('&')) {
-		current = current.replace('&', '?')
-	}
-
-	if (!current.startsWith('http://') && !current.startsWith('https://')) {
-		current = 'https://' + current
-	}
-
-	try {
-		const parsed = new URL(current)
-		if (!extractedRef) {
-			extractedRef = parsed.searchParams.get('ref') || parsed.searchParams.get('referer') || undefined
-		}
-		if (!extractedTok) {
-			extractedTok = parsed.searchParams.get('token') || undefined
-		}
-		if (!extractedOrigin) {
-			extractedOrigin = parsed.searchParams.get('origin') || undefined
-		}
-
-		parsed.searchParams.delete('ref')
-		parsed.searchParams.delete('referer')
-		parsed.searchParams.delete('token')
-		parsed.searchParams.delete('origin')
-
-		current = parsed.toString()
-	} catch {}
-
-	return {
-		cleanUrl: current,
-		ref: extractedRef,
-		token: extractedTok,
-		origin: extractedOrigin
-	}
-}
-
-/**
  * Main proxy route:
  * - Query format: /?url=https://cdn.anime.net/video.mp4
- * - Path format: /proxy?url=...
  * - Handles typo: ?url?=...
  */
 app.get('/', async (c) => {
 	let targetUrl = c.req.query('url')
 	if (!targetUrl) {
-		// Handle typo like ?url?=https://...
 		const rawQuery = new URL(c.req.url).search
 		const match = rawQuery.match(/[?&]url\??=([^&]+)/)
 		if (match && match[1]) {
@@ -459,9 +333,8 @@ app.get('/', async (c) => {
 
 	const parsed = cleanTargetUrlAndExtractParams(targetUrl)
 	const referer = c.req.query('referer') || c.req.query('ref') || parsed.ref || c.env?.DEFAULT_REFERER || 'https://nonton.blog/'
-	const token = extractAuthToken(c) || parsed.token || ''
 
-	return handleStreamProxy(c, parsed.cleanUrl, referer, token)
+	return handleStreamProxy(c, parsed.cleanUrl, referer)
 })
 
 app.get('/proxy', async (c) => {
@@ -475,33 +348,23 @@ app.get('/proxy', async (c) => {
 
 	const parsed = cleanTargetUrlAndExtractParams(targetUrl)
 	const referer = c.req.query('referer') || c.req.query('ref') || parsed.ref || c.env?.DEFAULT_REFERER || 'https://nonton.blog/'
-	const token = extractAuthToken(c) || parsed.token || ''
 
-	return handleStreamProxy(c, parsed.cleanUrl, referer, token)
+	return handleStreamProxy(c, parsed.cleanUrl, referer)
 })
 
 /**
- * DASH segment route: /dash/:tokB64/:refB64/*
- * Preserves token and referer safely in the URL path for XML segment resolution
+ * DASH segment route: /dash/:refB64/*
  */
-app.get('/dash/:tokB64/:refB64/*', async (c) => {
-	const tokB64 = c.req.param('tokB64')
+app.get('/dash/:refB64/*', async (c) => {
 	const refB64 = c.req.param('refB64')
-
-	let token = ''
 	let referer = 'https://nonton.blog/'
-
 	try {
-		token = Buffer.from(tokB64, 'base64url').toString('utf8')
 		referer = Buffer.from(refB64, 'base64url').toString('utf8')
-	} catch {
-		return c.json({ error: 'Invalid dash proxy parameters' }, 400, CORS_HEADERS)
-	}
+	} catch {}
 
 	const path = new URL(c.req.url).pathname
-	const prefix = `/dash/${tokB64}/${refB64}/`
+	const prefix = `/dash/${refB64}/`
 	let targetRaw = path.substring(path.indexOf(prefix) + prefix.length)
-
 	if (!targetRaw) {
 		return c.json({ error: 'Target URL missing' }, 400, CORS_HEADERS)
 	}
@@ -515,7 +378,37 @@ app.get('/dash/:tokB64/:refB64/*', async (c) => {
 		targetUrl = 'https://' + targetUrl
 	}
 
-	return handleStreamProxy(c, targetUrl, referer, token)
+	return handleStreamProxy(c, targetUrl, referer)
+})
+
+/**
+ * Legacy DASH segment route with token parameter: /dash/:tokB64/:refB64/*
+ */
+app.get('/dash/:tokB64/:refB64/*', async (c) => {
+	const refB64 = c.req.param('refB64')
+	let referer = 'https://nonton.blog/'
+	try {
+		referer = Buffer.from(refB64, 'base64url').toString('utf8')
+	} catch {}
+
+	const path = new URL(c.req.url).pathname
+	const tokB64 = c.req.param('tokB64')
+	const prefix = `/dash/${tokB64}/${refB64}/`
+	let targetRaw = path.substring(path.indexOf(prefix) + prefix.length)
+	if (!targetRaw) {
+		return c.json({ error: 'Target URL missing' }, 400, CORS_HEADERS)
+	}
+
+	let targetUrl = targetRaw
+	try {
+		targetUrl = decodeURIComponent(targetRaw)
+	} catch {}
+
+	if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+		targetUrl = 'https://' + targetUrl
+	}
+
+	return handleStreamProxy(c, targetUrl, referer)
 })
 
 /**
@@ -530,12 +423,10 @@ app.get('/stream/:stream_key', async (c) => {
 	try {
 		const streamKeyObj = JSON.parse(
 			Buffer.from(stream_key, 'base64url').toString('utf8')
-		) as { directUrl: string; referer: string; token?: string }
+		) as { directUrl: string; referer: string }
 
 		const { directUrl, referer } = streamKeyObj
-		const token = streamKeyObj.token || extractAuthToken(c) || ''
-
-		return handleStreamProxy(c, directUrl, referer || 'https://nonton.blog/', token)
+		return handleStreamProxy(c, directUrl, referer || 'https://nonton.blog/')
 	} catch (error: any) {
 		return c.json({
 			error: 'Invalid stream_key',
