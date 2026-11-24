@@ -344,6 +344,96 @@ app.options('*', (c) => {
 })
 
 /**
+ * Clean target URL and unwrap any recursive proxy layers, extracting leaked ref/token/origin.
+ */
+function cleanTargetUrlAndExtractParams(targetUrl: string): {
+	cleanUrl: string
+	ref?: string
+	token?: string
+	origin?: string
+} {
+	let current = targetUrl.trim()
+	let extractedRef: string | undefined
+	let extractedTok: string | undefined
+	let extractedOrigin: string | undefined
+
+	while (
+		current.includes('proxy.nonton.blog') ||
+		current.includes('/api/proxy')
+	) {
+		const mRef = current.match(/[?&](?:ref|referer)=([^&]+)/)
+		if (mRef && mRef[1] && !extractedRef) {
+			try {
+				extractedRef = decodeURIComponent(mRef[1])
+			} catch {
+				extractedRef = mRef[1]
+			}
+		}
+		const mTok = current.match(/[?&]token=([^&]+)/)
+		if (mTok && mTok[1] && !extractedTok) {
+			try {
+				extractedTok = decodeURIComponent(mTok[1])
+			} catch {
+				extractedTok = mTok[1]
+			}
+		}
+		const mOrig = current.match(/[?&]origin=([^&]+)/)
+		if (mOrig && mOrig[1] && !extractedOrigin) {
+			try {
+				extractedOrigin = decodeURIComponent(mOrig[1])
+			} catch {
+				extractedOrigin = mOrig[1]
+			}
+		}
+		const match = current.match(/[?&]url=([^&]+)/)
+		if (match && match[1]) {
+			try {
+				current = decodeURIComponent(match[1])
+			} catch {
+				current = match[1]
+			}
+		} else {
+			break
+		}
+	}
+
+	if (!current.includes('?') && current.includes('&')) {
+		current = current.replace('&', '?')
+	}
+
+	if (!current.startsWith('http://') && !current.startsWith('https://')) {
+		current = 'https://' + current
+	}
+
+	try {
+		const parsed = new URL(current)
+		if (!extractedRef) {
+			extractedRef = parsed.searchParams.get('ref') || parsed.searchParams.get('referer') || undefined
+		}
+		if (!extractedTok) {
+			extractedTok = parsed.searchParams.get('token') || undefined
+		}
+		if (!extractedOrigin) {
+			extractedOrigin = parsed.searchParams.get('origin') || undefined
+		}
+
+		parsed.searchParams.delete('ref')
+		parsed.searchParams.delete('referer')
+		parsed.searchParams.delete('token')
+		parsed.searchParams.delete('origin')
+
+		current = parsed.toString()
+	} catch {}
+
+	return {
+		cleanUrl: current,
+		ref: extractedRef,
+		token: extractedTok,
+		origin: extractedOrigin
+	}
+}
+
+/**
  * Main proxy route:
  * - Query format: /?url=https://cdn.anime.net/video.mp4
  * - Path format: /proxy?url=...
@@ -367,45 +457,11 @@ app.get('/', async (c) => {
 		}, 400, CORS_HEADERS)
 	}
 
-	// Auto-unwrap recursive proxy loops if any
-	let targetUrlRefMatch = targetUrl.match(/[?&]ref=([^&]+)/)
-	let targetUrlTokMatch = targetUrl.match(/[?&]token=([^&]+)/)
-	while (
-		targetUrl.includes('proxy.nonton.blog') ||
-		targetUrl.includes('/api/proxy')
-	) {
-		const match = targetUrl.match(/[?&]url=([^&]+)/)
-		if (match && match[1]) {
-			try {
-				targetUrl = decodeURIComponent(match[1])
-			} catch {
-				targetUrl = match[1]
-			}
-		} else {
-			break
-		}
-	}
+	const parsed = cleanTargetUrlAndExtractParams(targetUrl)
+	const referer = c.req.query('referer') || c.req.query('ref') || parsed.ref || c.env?.DEFAULT_REFERER || 'https://nonton.blog/'
+	const token = extractAuthToken(c) || parsed.token || ''
 
-	if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-		targetUrl = 'https://' + targetUrl
-	}
-
-	let referer = c.req.query('referer') || c.req.query('ref')
-	if (!referer && targetUrlRefMatch && targetUrlRefMatch[1]) {
-		try {
-			referer = decodeURIComponent(targetUrlRefMatch[1])
-		} catch {}
-	}
-	referer = referer || c.env?.DEFAULT_REFERER || 'https://nonton.blog/'
-
-	let token = extractAuthToken(c)
-	if (!token && targetUrlTokMatch && targetUrlTokMatch[1]) {
-		try {
-			token = decodeURIComponent(targetUrlTokMatch[1])
-		} catch {}
-	}
-
-	return handleStreamProxy(c, targetUrl, referer, token || '')
+	return handleStreamProxy(c, parsed.cleanUrl, referer, token)
 })
 
 app.get('/proxy', async (c) => {
@@ -417,45 +473,11 @@ app.get('/proxy', async (c) => {
 		}, 400, CORS_HEADERS)
 	}
 
-	// Auto-unwrap recursive proxy loops if any
-	let targetUrlRefMatch = targetUrl.match(/[?&]ref=([^&]+)/)
-	let targetUrlTokMatch = targetUrl.match(/[?&]token=([^&]+)/)
-	while (
-		targetUrl.includes('proxy.nonton.blog') ||
-		targetUrl.includes('/api/proxy')
-	) {
-		const match = targetUrl.match(/[?&]url=([^&]+)/)
-		if (match && match[1]) {
-			try {
-				targetUrl = decodeURIComponent(match[1])
-			} catch {
-				targetUrl = match[1]
-			}
-		} else {
-			break
-		}
-	}
+	const parsed = cleanTargetUrlAndExtractParams(targetUrl)
+	const referer = c.req.query('referer') || c.req.query('ref') || parsed.ref || c.env?.DEFAULT_REFERER || 'https://nonton.blog/'
+	const token = extractAuthToken(c) || parsed.token || ''
 
-	if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-		targetUrl = 'https://' + targetUrl
-	}
-
-	let referer = c.req.query('referer') || c.req.query('ref')
-	if (!referer && targetUrlRefMatch && targetUrlRefMatch[1]) {
-		try {
-			referer = decodeURIComponent(targetUrlRefMatch[1])
-		} catch {}
-	}
-	referer = referer || c.env?.DEFAULT_REFERER || 'https://nonton.blog/'
-
-	let token = extractAuthToken(c)
-	if (!token && targetUrlTokMatch && targetUrlTokMatch[1]) {
-		try {
-			token = decodeURIComponent(targetUrlTokMatch[1])
-		} catch {}
-	}
-
-	return handleStreamProxy(c, targetUrl, referer, token || '')
+	return handleStreamProxy(c, parsed.cleanUrl, referer, token)
 })
 
 /**
