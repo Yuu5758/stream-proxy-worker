@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { cors } from 'hono/cors'
 import { Buffer } from 'node:buffer'
 
 type Bindings = {
@@ -9,10 +10,22 @@ const app = new Hono<{ Bindings: Bindings }>()
 
 const CORS_HEADERS = {
 	'Access-Control-Allow-Origin': '*',
-	'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-	'Access-Control-Allow-Headers': 'Range, Authorization, Cookie, Content-Type, X-Requested-With',
+	'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
+	'Access-Control-Allow-Headers': 'Range, Authorization, Cookie, Content-Type, X-Requested-With, Origin, Accept',
 	'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type',
 }
+
+// Global Hono CORS Middleware
+app.use(
+	'*',
+	cors({
+		origin: (origin) => origin || '*',
+		allowMethods: ['GET', 'HEAD', 'POST', 'OPTIONS'],
+		allowHeaders: ['Range', 'Authorization', 'Cookie', 'Content-Type', 'X-Requested-With', 'Origin', 'Accept'],
+		exposeHeaders: ['Content-Length', 'Content-Range', 'Accept-Ranges', 'Content-Type'],
+		maxAge: 86400,
+	})
+)
 
 /**
  * Clean target URL and unwrap any recursive proxy layers, extracting leaked ref/origin.
