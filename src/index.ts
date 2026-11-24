@@ -371,7 +371,7 @@ app.get('/', async (c) => {
 		targetUrl = 'https://' + targetUrl
 	}
 
-	const referer = c.req.query('referer') || c.env?.DEFAULT_REFERER || 'https://nonton.blog/'
+	const referer = c.req.query('referer') || c.req.query('ref') || c.env?.DEFAULT_REFERER || 'https://nonton.blog/'
 	const token = extractAuthToken(c)
 
 	return handleStreamProxy(c, targetUrl, referer, token || '')
@@ -390,7 +390,7 @@ app.get('/proxy', async (c) => {
 		targetUrl = 'https://' + targetUrl
 	}
 
-	const referer = c.req.query('referer') || c.env?.DEFAULT_REFERER || 'https://nonton.blog/'
+	const referer = c.req.query('referer') || c.req.query('ref') || c.env?.DEFAULT_REFERER || 'https://nonton.blog/'
 	const token = extractAuthToken(c)
 
 	return handleStreamProxy(c, targetUrl, referer, token || '')
