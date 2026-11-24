@@ -1,265 +1,81 @@
 # Stream Proxy Worker
 
-A lightweight Cloudflare Worker that proxies streaming content (HLS, video, audio) while preserving referrer headers and enabling CORS access.
+Cloudflare Worker berkinerja tinggi untuk mem-proxy streaming video/audio (MP4, HLS `.m3u8`, DASH `.mpd`) dengan verifikasi cookie/token wajib dari **nonton.blog**, auto-rewrite manifest, forwarding byte-range headers, dan perlindungan CORS.
 
-## Features
+---
 
-- 🚀 **Zero CPU overhead** - Streams pass through without buffering
-- 🔒 **Referrer preservation** - Bypass referrer restrictions on streaming content
-- 🌐 **CORS enabled** - Access streams from any origin
-- 📹 **Range request support** - Seek support for video playback
-- 🔑 **Secure URL encoding** - Base64URL encoded stream keys
+## Fitur Utama
 
-## How It Works
+- 🔒 **Wajib Cookie / Token (Strict Auth)**: Setiap request stream wajib menyertakan cookie `nonton_jwt_token` atau header `Authorization: Bearer <token>`. Worker memverifikasi token secara real-time ke endpoint backend Rust `https://nonton.blog/api/auth/verify-cookie`.
+- 📺 **Dukungan HLS Manifest (`.m3u8`)**: Otomatis me-rewrite URI chunk (`.ts`), key enkripsi (`#EXT-X-KEY`), `#EXT-X-MAP`, dan sub-playlist agar seluruh segmen tetap melewati proxy worker dengan membawa autentikasi dan referer.
+- 📦 **Dukungan DASH Manifest (`.mpd`)**: Otomatis me-rewrite / menginjeksi `<BaseURL>` dan atribut `media` / `initialization` ke format route `/dash/:token/:referer/*`, sehingga seluruh segmen `.m4s` di-load via worker proxy tanpa kehilangan cookie session.
+- ⏩ **HTTP Range Requests (Video Seeking)**: Meneruskan header `Range` dan `Content-Range` sehingga video MP4 dan segmen dapat di-seek lancar tanpa buffering penuh.
+- 🌐 **CORS Preflight & Headers**: Mendukung streaming cross-origin dengan header `Access-Control-Allow-Origin: *`.
 
-The worker acts as a transparent proxy that:
-1. Decodes a base64-encoded stream configuration
-2. Fetches the content with the proper referrer header
-3. Streams the response directly to the client
+---
 
-Since Cloudflare Workers stream responses without buffering, there are no CPU time limit issues for streaming content.
+## Endpoint & Format Penggunaan
 
-## Installation
+### 1. Format Query (Rekomendasi Player)
+```
+GET https://proxy.nonton.blog/?url=https://cdn.anime.net/stream.m3u8
+```
+- Parameter query:
+  - `url` *(wajib)*: URL stream target (didukung format `?url=...` maupun toleran typo `url?=...`).
+  - `referer` *(opsional)*: Default ke `https://nonton.blog/`.
+  - `token` *(opsional)*: Token JWT jika tidak bisa mengirim cookie via header.
 
-### Prerequisites
-- Node.js 16+ and npm/yarn/pnpm
-- Cloudflare account
-- Wrangler CLI
+### 2. Format Path DASH Segment
+```
+GET https://proxy.nonton.blog/dash/:tokenB64/:refererB64/:encodedUrl
+```
+Dibuat otomatis oleh worker saat mem-proxy manifest DASH `.mpd`.
 
-### Setup
-
-1. Clone the repository:
-```bash
-git clone <your-repo-url>
-cd stream-proxy-worker
+### 3. Format Legacy Base64 Stream Key
+```
+GET https://proxy.nonton.blog/stream/:stream_key
+```
+Di mana `:stream_key` adalah objek JSON yang di-base64url encode:
+```json
+{
+  "directUrl": "https://cdn.anime.net/stream.m3u8",
+  "referer": "https://nonton.blog/",
+  "token": "eyJhbGciOi..."
+}
 ```
 
-2. Install dependencies:
+---
+
+## Autentikasi Cookies
+
+Worker memeriksa autentikasi melalui urutan berikut:
+1. Header `Authorization: Bearer <JWT>`
+2. Header `Cookie: nonton_jwt_token=<JWT>`
+3. Query string `?token=<JWT>` atau `?cookie=<JWT>`
+
+Jika token hilang atau tidak valid saat divalidasi ke Rust backend (`/api/auth/verify-cookie`), Worker akan mengembalikan HTTP 401 Unauthorized:
+```json
+{
+  "error": "Forbidden",
+  "message": "Wajib cookies/token: Autentikasi session nonton.blog diperlukan."
+}
+```
+
+---
+
+## Deploy ke Cloudflare Workers
+
+1. Install dependencies:
 ```bash
 npm install
 ```
 
-3. Configure Cloudflare credentials:
-```bash
-npx wrangler login
-```
-
-4. Deploy to Cloudflare Workers:
-```bash
-npm run deploy
-```
-
-## Usage
-
-### Generating a Stream Key
-
-A stream key is a base64URL-encoded JSON object containing:
-- `directUrl`: The actual stream URL
-- `referer`: The referrer header to send
-
-**JavaScript/TypeScript:**
-```javascript
-const streamKeyObj = {
-  directUrl: "https://example.com/stream.m3u8",
-  referer: "https://example.com"
-}
-
-// For browser
-const streamKey = btoa(JSON.stringify(streamKeyObj))
-  .replace(/\+/g, '-')
-  .replace(/\//g, '_')
-  .replace(/=/g, '');
-
-// For Node.js
-const streamKey = Buffer.from(JSON.stringify(streamKeyObj))
-  .toString('base64url');
-
-console.log(streamKey);
-```
-
-**Python:**
-```python
-import json
-import base64
-
-stream_key_obj = {
-    "directUrl": "https://example.com/stream.m3u8",
-    "referer": "https://example.com"
-}
-
-stream_key = base64.urlsafe_b64encode(
-    json.dumps(stream_key_obj).encode()
-).decode().rstrip('=')
-
-print(stream_key)
-```
-
-### Making Requests
-
-Once you have your stream key, access the stream via:
-```
-https://your-worker.workers.dev/stream/{stream_key}
-```
-
-**Example with HTML5 Video:**
-```html
-<video controls>
-  <source src="https://your-worker.workers.dev/stream/eyJkaXJlY3RVcmwiOiJodHRwczovL2V4YW1wbGUuY29tL3N0cmVhbS5tM3U4IiwicmVmZXJlciI6Imh0dHBzOi8vZXhhbXBsZS5jb20ifQ" type="application/x-mpegURL">
-</video>
-```
-
-**Example with fetch:**
-```javascript
-const response = await fetch(
-  `https://your-worker.workers.dev/stream/${streamKey}`
-);
-const stream = await response.blob();
-```
-
-## API Reference
-
-### `GET /stream/:stream_key`
-
-Proxies a stream with the specified configuration.
-
-**Parameters:**
-- `stream_key` (path parameter, required): Base64URL-encoded JSON configuration
-
-**Stream Key Object:**
-```typescript
-{
-  directUrl: string;  // The actual stream URL to fetch
-  referer: string;    // The Referer header to send
-}
-```
-
-**Response:**
-- `200`: Stream content (proxied response)
-- `400`: Invalid stream key format
-- `404`: Endpoint not found
-- `500`: Stream fetch failed
-
-**Headers:**
-- Supports `Range` requests for video seeking
-- Returns CORS headers for cross-origin access
-- Preserves essential content headers (Content-Type, Content-Length, etc.)
-
-## Development
-
-### Local Development
+2. Jalankan lokal dev:
 ```bash
 npm run dev
 ```
 
-This starts a local development server using Wrangler.
-
-### Testing
-
-Create a test stream key:
+3. Deploy ke Cloudflare:
 ```bash
-node -e "console.log(Buffer.from(JSON.stringify({directUrl:'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',referer:'https://mux.com'})).toString('base64url'))"
+npm run deploy
 ```
-
-Test the endpoint:
-```bash
-curl "http://localhost:8787/stream/GENERATED_KEY"
-```
-
-## Configuration
-
-Edit `wrangler.toml` to configure:
-- Worker name
-- Routes and custom domains
-- Environment variables
-- Compatibility settings
-```toml
-name = "stream-proxy-worker"
-main = "src/index.ts"
-compatibility_date = "2024-01-01"
-
-[vars]
-# Add any environment variables here
-```
-
-## Limitations & Considerations
-
-### Cloudflare Workers Limits
-- **Free Tier**: 100,000 requests/day, 10ms CPU time per request
-- **Paid Tier**: Unlimited requests, 50ms CPU time per request
-- **Note**: Streaming responses don't count against CPU time limits
-
-### Use Cases
-✅ **Good for:**
-- Proxying HLS/DASH streams
-- Bypassing referrer restrictions
-- Adding CORS to streaming content
-- Video seeking with range requests
-
-❌ **Not recommended for:**
-- Extremely high-traffic streaming (consider CDN costs)
-- Downloading large files (no CPU limit but bandwidth costs apply)
-
-## Security Considerations
-
-⚠️ **Important**: This proxy allows anyone with a valid stream key to access content through your worker.
-
-**Recommendations:**
-- Rate limiting (implement in the worker or via Cloudflare firewall)
-- Stream key expiration (add timestamp to the encoded object)
-- Domain whitelisting (only allow specific `directUrl` domains)
-- Authentication (add API key verification)
-
-**Example with domain whitelist:**
-```typescript
-const ALLOWED_DOMAINS = ['example.com', 'trusted-cdn.com'];
-
-const url = new URL(directUrl);
-if (!ALLOWED_DOMAINS.includes(url.hostname)) {
-  return c.json({ error: 'Domain not allowed' }, 403);
-}
-```
-
-## Troubleshooting
-
-**Stream not loading:**
-- Verify the stream key is properly base64URL encoded
-- Check that the `directUrl` is accessible
-- Ensure the `referer` matches what the origin expects
-
-**CORS errors:**
-- The worker automatically adds CORS headers
-- If issues persist, check browser console for specific error messages
-
-**429 Too Many Requests:**
-- You've hit Cloudflare's rate limits
-- Upgrade to paid plan or implement caching
-
-## Contributing
-
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
-
-## License
-
-MIT License - see LICENSE file for details
-
-## Acknowledgments
-
-Built with:
-- [Hono](https://hono.dev/) - Fast web framework for Cloudflare Workers
-- [Cloudflare Workers](https://workers.cloudflare.com/) - Serverless platform
-- [Wrangler](https://developers.cloudflare.com/workers/wrangler/) - CLI tool for Workers
-
-## Support
-
-For issues and questions:
-- Open an issue on GitHub
-- Check Cloudflare Workers documentation
-- Review Hono framework docs
-
----
-
-**Disclaimer**: Ensure you have the rights to proxy any content through this worker. This tool is for legitimate use cases only.
